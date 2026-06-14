@@ -1,0 +1,8 @@
+streamlit>=1.28.0
+pypdf>=4.0.0
+langchain
+langchain-text-splitters
+langchain-community
+langchain-google-genai
+chromadb
+python-dotenv
