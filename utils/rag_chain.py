@@ -1,24 +1,16 @@
-import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-
-print("ENV FILE LOADED")
-print("GOOGLE_API_KEY =", os.getenv("GOOGLE_API_KEY"))
+from langchain_ollama import ChatOllama
 
 DEFAULT_COLLECTION_NAME = "pdf_chunks"
 DEFAULT_PERSIST_DIRECTORY = "./chroma_db"
-EMBEDDING_MODEL = "models/gemini-embedding-001"
-LLM_MODEL = "gemini-2.0-flash"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+LLM_MODEL = "gemma3:4b"
 TOP_K = 3
 
 RAG_PROMPT = ChatPromptTemplate.from_template(
@@ -37,20 +29,20 @@ Answer:"""
 )
 
 
-def _get_embeddings() -> GoogleGenerativeAIEmbeddings:
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is not set. Add it to your .env file.")
+def _get_embeddings() -> HuggingFaceEmbeddings:
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=api_key)
 
-
-def _get_llm() -> ChatGoogleGenerativeAI:
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is not set. Add it to your .env file.")
-
-    return ChatGoogleGenerativeAI(model=LLM_MODEL, google_api_key=api_key)
+def _get_llm() -> ChatOllama:
+    """Return the local Ollama LLM (Gemma3:4b) for answer generation."""
+    return ChatOllama(
+        model=LLM_MODEL,
+        temperature=0,
+    )
 
 
 def _format_docs(docs) -> str:
@@ -64,7 +56,7 @@ def store_chunks_in_chroma(
     persist_directory: str = DEFAULT_PERSIST_DIRECTORY,
     source: str | None = None,
 ) -> Chroma:
-    """Embed text chunks with Google Generative AI and store them in ChromaDB."""
+    """Embed text chunks locally and store them in ChromaDB."""
     if not chunks:
         raise ValueError("No chunks provided to store.")
 
@@ -134,7 +126,7 @@ def create_rag_chain(
     collection_name: str = DEFAULT_COLLECTION_NAME,
     persist_directory: str = DEFAULT_PERSIST_DIRECTORY,
 ):
-    """Build a Gemini RAG chain that answers only from retrieved chunks."""
+    """Build a local RAG chain using Ollama (Gemma3:4b) over retrieved chunks."""
     retriever = get_retriever(
         k=k,
         collection_name=collection_name,
@@ -174,7 +166,7 @@ def answer_question_with_sources(
     collection_name: str = DEFAULT_COLLECTION_NAME,
     persist_directory: str = DEFAULT_PERSIST_DIRECTORY,
 ) -> tuple[str, list[str]]:
-    """Answer a question and return the source chunks used for context."""
+    """Answer a question with the local Ollama LLM and return source chunks."""
     retriever = get_retriever(
         k=k,
         collection_name=collection_name,

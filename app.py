@@ -1,12 +1,8 @@
 import io
 import shutil
-from pathlib import Path
 
-from dotenv import load_dotenv
 import streamlit as st
 from pypdf import PdfReader
-
-load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from utils.pdf_loader import split_pdf_text
 from utils.rag_chain import (
