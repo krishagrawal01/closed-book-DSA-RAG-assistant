@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -8,17 +9,35 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_ollama import ChatOllama
 
 DEFAULT_COLLECTION_NAME = "pdf_chunks"
-DEFAULT_PERSIST_DIRECTORY = "./chroma_db"
+DEFAULT_PERSIST_DIRECTORY = "./data/chroma_db"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-LLM_MODEL = "gemma3:4b"
+LLM_MODEL = "qwen3:4b"
 TOP_K = 3
+
+logger = logging.getLogger(__name__)
 
 RAG_PROMPT = ChatPromptTemplate.from_template(
     """You are a closed-book study assistant for data structures and algorithms.
 
 Answer the question using ONLY the context below. Do not use outside knowledge.
+Keep answers concise and student-friendly.
+
 If the context does not contain enough information, reply exactly with:
 "I cannot find that information in the uploaded document."
+
+Otherwise, format every answer exactly like this:
+
+### Definition
+Short definition (1-2 sentences)
+
+### Explanation
+Simple explanation in easy language (2-4 sentences)
+
+### Example
+Small example if available (write "Not available in the document." if the context has no example)
+
+### Key Points
+- 3-5 bullet points summarizing the most important ideas
 
 Context:
 {context}
@@ -37,10 +56,42 @@ def _get_embeddings() -> HuggingFaceEmbeddings:
     )
 
 
+def validate_ollama_model(model: str = LLM_MODEL) -> tuple[bool, str]:
+    """Check whether the configured Ollama model is installed and reachable."""
+    try:
+        import ollama
+    except ImportError:
+        return False, (
+            f"The ollama package is not installed. "
+            f"Install dependencies, then run: ollama pull {model}"
+        )
+
+    try:
+        response = ollama.list()
+        installed = {entry.model for entry in response.models}
+        if model in installed or f"{model}:latest" in installed:
+            return True, ""
+
+        model_base = model.split(":")[0]
+        for name in installed:
+            if name == model or name.startswith(f"{model}:") or name.split(":")[0] == model_base:
+                return True, ""
+
+        return False, (
+            f"Ollama model '{model}' is not installed. "
+            f"Run: ollama pull {model}"
+        )
+    except Exception as error:
+        return False, (
+            f"Could not connect to Ollama ({error}). "
+            f"Make sure Ollama is running, then run: ollama pull {model}"
+        )
+
+
 def _get_llm() -> ChatOllama:
-    """Return the local Ollama LLM (Gemma3:4b) for answer generation."""
+    """Return the local Ollama LLM (Qwen3:4b) for answer generation."""
     return ChatOllama(
-        model=LLM_MODEL,
+        model="qwen3:4b",
         temperature=0,
     )
 
@@ -75,6 +126,35 @@ def store_chunks_in_chroma(
         collection_name=collection_name,
         persist_directory=persist_directory,
     )
+
+
+def delete_chroma_collection(
+    collection_name: str,
+    *,
+    persist_directory: str = DEFAULT_PERSIST_DIRECTORY,
+) -> bool:
+    """Delete a Chroma collection from the persistent store."""
+    import chromadb
+    from chromadb.errors import NotFoundError
+
+    Path(persist_directory).mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=persist_directory)
+    try:
+        client.delete_collection(name=collection_name)
+        logger.info("Deleted Chroma collection: %s", collection_name)
+        return True
+    except NotFoundError:
+        logger.warning(
+            "Chroma collection not found, skipping deletion: %s",
+            collection_name,
+        )
+        return False
+    except ValueError:
+        logger.warning(
+            "Chroma collection not found, skipping deletion: %s",
+            collection_name,
+        )
+        return False
 
 
 def _load_chroma(
@@ -126,7 +206,7 @@ def create_rag_chain(
     collection_name: str = DEFAULT_COLLECTION_NAME,
     persist_directory: str = DEFAULT_PERSIST_DIRECTORY,
 ):
-    """Build a local RAG chain using Ollama (Gemma3:4b) over retrieved chunks."""
+    """Build a local RAG chain using Ollama (Qwen3:4b) over retrieved chunks."""
     retriever = get_retriever(
         k=k,
         collection_name=collection_name,
@@ -166,7 +246,7 @@ def answer_question_with_sources(
     collection_name: str = DEFAULT_COLLECTION_NAME,
     persist_directory: str = DEFAULT_PERSIST_DIRECTORY,
 ) -> tuple[str, list[str]]:
-    """Answer a question with the local Ollama LLM and return source chunks."""
+    """Answer a question with the local Ollama LLM (Qwen3:4b) and return source chunks."""
     retriever = get_retriever(
         k=k,
         collection_name=collection_name,

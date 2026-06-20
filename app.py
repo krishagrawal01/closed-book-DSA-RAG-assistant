@@ -1,14 +1,29 @@
 import io
-import shutil
+from datetime import datetime, timezone
+from pathlib import Path
 
 import streamlit as st
 from pypdf import PdfReader
 
 from utils.pdf_loader import split_pdf_text
+from utils.pdf_registry import (
+    add_pdf_entry,
+    delete_pdf_file,
+    ensure_data_dirs,
+    get_pdf_entry,
+    load_registry,
+    make_collection_name,
+    remove_pdf_entry,
+    save_pdf_file,
+    update_pdf_entry,
+)
 from utils.rag_chain import (
     DEFAULT_PERSIST_DIRECTORY,
+    LLM_MODEL,
     answer_question_with_sources,
+    delete_chroma_collection,
     store_chunks_in_chroma,
+    validate_ollama_model,
 )
 
 st.set_page_config(
@@ -17,27 +32,43 @@ st.set_page_config(
     layout="wide",
 )
 
+ensure_data_dirs()
+
+model_ready, model_error = validate_ollama_model(LLM_MODEL)
+if not model_ready:
+    st.error(model_error)
+    st.stop()
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "pdf_name" not in st.session_state:
-    st.session_state.pdf_name = None
+if "selected_pdf" not in st.session_state:
+    st.session_state.selected_pdf = None
 
-if "pdf_indexed" not in st.session_state:
-    st.session_state.pdf_indexed = False
+if "active_collection_name" not in st.session_state:
+    st.session_state.active_collection_name = None
 
-if "chunk_count" not in st.session_state:
-    st.session_state.chunk_count = 0
+if "active_chunk_count" not in st.session_state:
+    st.session_state.active_chunk_count = 0
 
 
-def extract_pdf_text(uploaded_file: io.BytesIO) -> str:
-    reader = PdfReader(uploaded_file)
+def extract_pdf_text(source: io.BytesIO | Path | str) -> str:
+    if isinstance(source, (Path, str)):
+        reader = PdfReader(str(source))
+    else:
+        reader = PdfReader(source)
     pages = [page.extract_text() or "" for page in reader.pages]
     return "\n\n".join(pages).strip()
 
 
-def index_pdf(uploaded_file) -> tuple[bool, str]:
-    text = extract_pdf_text(uploaded_file)
+def activate_pdf(entry: dict) -> None:
+    st.session_state.selected_pdf = entry["filename"]
+    st.session_state.active_collection_name = entry["collection_name"]
+    st.session_state.active_chunk_count = entry["chunk_count"]
+
+
+def index_pdf_file(filename: str, pdf_path: Path, *, reindex: bool = False) -> tuple[bool, str]:
+    text = extract_pdf_text(pdf_path)
     if not text.strip():
         return False, "The uploaded PDF did not contain extractable text."
 
@@ -45,20 +76,97 @@ def index_pdf(uploaded_file) -> tuple[bool, str]:
     if not chunks:
         return False, "The uploaded PDF did not produce any text chunks."
 
-    shutil.rmtree(DEFAULT_PERSIST_DIRECTORY, ignore_errors=True)
-    store_chunks_in_chroma(chunks, source=uploaded_file.name)
+    existing_entry = get_pdf_entry(filename)
+    collection_name = (
+        existing_entry["collection_name"]
+        if existing_entry
+        else make_collection_name(filename)
+    )
 
-    st.session_state.pdf_indexed = True
-    st.session_state.chunk_count = len(chunks)
-    return True, text
+    delete_chroma_collection(collection_name, persist_directory=DEFAULT_PERSIST_DIRECTORY)
+    store_chunks_in_chroma(
+        chunks,
+        collection_name=collection_name,
+        persist_directory=DEFAULT_PERSIST_DIRECTORY,
+        source=filename,
+    )
+
+    file_path = str(pdf_path)
+    if existing_entry:
+        update_pdf_entry(
+            filename,
+            chunk_count=len(chunks),
+            collection_name=collection_name,
+            file_path=file_path,
+            upload_date=datetime.now(timezone.utc).isoformat(),
+        )
+        entry = get_pdf_entry(filename)
+    else:
+        entry = add_pdf_entry(
+            filename,
+            collection_name=collection_name,
+            chunk_count=len(chunks),
+            file_path=file_path,
+        )
+
+    activate_pdf(entry)
+    if reindex:
+        return True, f"Reindexed **{filename}** ({len(chunks)} chunks)."
+    return True, f"Indexed **{filename}** ({len(chunks)} chunks)."
+
+
+def handle_upload(uploaded_file) -> None:
+    filename = uploaded_file.name
+    existing_entry = get_pdf_entry(filename)
+
+    if existing_entry and Path(existing_entry["file_path"]).exists():
+        activate_pdf(existing_entry)
+        st.session_state.messages = []
+        st.info("PDF already indexed.")
+        return
+
+    pdf_path = save_pdf_file(filename, uploaded_file.getbuffer())
+    success, message = index_pdf_file(filename, pdf_path)
+    st.session_state.messages = []
+
+    if success:
+        st.success(message)
+    else:
+        delete_pdf_file(str(pdf_path))
+        st.session_state.selected_pdf = None
+        st.session_state.active_collection_name = None
+        st.session_state.active_chunk_count = 0
+        st.warning(message)
+
+
+def delete_selected_pdf(filename: str) -> None:
+    entry = get_pdf_entry(filename)
+    if not entry:
+        return
+
+    delete_chroma_collection(
+        entry["collection_name"],
+        persist_directory=DEFAULT_PERSIST_DIRECTORY,
+    )
+    delete_pdf_file(entry["file_path"])
+    remove_pdf_entry(filename)
+
+    st.session_state.messages = []
+    st.session_state.selected_pdf = None
+    st.session_state.active_collection_name = None
+    st.session_state.active_chunk_count = 0
 
 
 def generate_response(question: str) -> tuple[str, list[str]]:
-    if not st.session_state.pdf_indexed:
-        return "Please upload a PDF first so I can answer questions from your document.", []
+    if not st.session_state.active_collection_name:
+        return "Please upload or select an indexed PDF first.", []
 
     try:
-        return answer_question_with_sources(question)
+        return answer_question_with_sources(
+            question,
+            collection_name=st.session_state.active_collection_name,
+            persist_directory=DEFAULT_PERSIST_DIRECTORY,
+        )
     except ValueError as error:
         return str(error), []
     except Exception as error:
@@ -77,8 +185,51 @@ def render_assistant_message(content: str, sources: list[str] | None = None) -> 
 st.title("Closed-Book DSA RAG Assistant")
 st.caption("Upload a PDF and ask questions grounded in your document.")
 
+registry_entries = load_registry()
+indexed_filenames = [entry["filename"] for entry in registry_entries]
+
 with st.sidebar:
     st.header("Document")
+
+    if indexed_filenames:
+        default_index = 0
+        if st.session_state.selected_pdf in indexed_filenames:
+            default_index = indexed_filenames.index(st.session_state.selected_pdf)
+
+        selected_filename = st.selectbox(
+            "Indexed PDFs",
+            indexed_filenames,
+            index=default_index,
+        )
+        selected_entry = get_pdf_entry(selected_filename)
+        if selected_entry:
+            activate_pdf(selected_entry)
+            st.caption(f"{selected_entry['chunk_count']} chunks indexed")
+            st.caption(f"Uploaded: {selected_entry['upload_date'][:10]}")
+
+        col_delete, col_reindex = st.columns(2)
+        with col_delete:
+            if st.button("Delete PDF", use_container_width=True):
+                delete_selected_pdf(selected_filename)
+                st.rerun()
+        with col_reindex:
+            if st.button("Reindex PDF", use_container_width=True):
+                with st.spinner("Reindexing PDF..."):
+                    pdf_path = Path(selected_entry["file_path"])
+                    success, message = index_pdf_file(
+                        selected_filename,
+                        pdf_path,
+                        reindex=True,
+                    )
+                st.session_state.messages = []
+                if success:
+                    st.success(message)
+                else:
+                    st.warning(message)
+                st.rerun()
+    else:
+        st.caption("No PDFs indexed yet.")
+
     uploaded_file = st.file_uploader(
         "Upload PDF",
         type=["pdf"],
@@ -86,28 +237,10 @@ with st.sidebar:
     )
 
     if uploaded_file is not None:
-        if st.session_state.pdf_name != uploaded_file.name:
-            with st.spinner("Indexing PDF..."):
-                indexed, result = index_pdf(uploaded_file)
-                st.session_state.pdf_name = uploaded_file.name
-                st.session_state.messages = []
-
-                if not indexed:
-                    st.session_state.pdf_indexed = False
-                    st.session_state.chunk_count = 0
-                    st.warning(result)
-
-        if st.session_state.pdf_indexed:
-            st.success(f"Loaded **{uploaded_file.name}**")
-            st.caption(f"{st.session_state.chunk_count} chunks indexed")
-
-    if st.session_state.pdf_name:
-        if st.button("Clear document"):
-            shutil.rmtree(DEFAULT_PERSIST_DIRECTORY, ignore_errors=True)
-            st.session_state.pdf_name = None
-            st.session_state.pdf_indexed = False
-            st.session_state.chunk_count = 0
-            st.session_state.messages = []
+        if st.session_state.get("last_upload_name") != uploaded_file.name:
+            with st.spinner("Processing PDF..."):
+                handle_upload(uploaded_file)
+            st.session_state.last_upload_name = uploaded_file.name
             st.rerun()
 
 for message in st.session_state.messages:
