@@ -157,23 +157,41 @@ def delete_selected_pdf(filename: str) -> None:
     st.session_state.active_chunk_count = 0
 
 
-def generate_response(question: str) -> tuple[str, list[str]]:
+def generate_response(question: str) -> tuple[str, list[str], bool]:
     if not st.session_state.active_collection_name:
-        return "Please upload or select an indexed PDF first.", []
+        return "Please upload or select an indexed PDF first.", [], False
+
+    allow_outside_knowledge = st.session_state.get("allow_outside_knowledge", False)
 
     try:
-        return answer_question_with_sources(
+        answer, sources = answer_question_with_sources(
             question,
             collection_name=st.session_state.active_collection_name,
             persist_directory=DEFAULT_PERSIST_DIRECTORY,
+            allow_outside_knowledge=allow_outside_knowledge,
         )
+        return answer, sources, allow_outside_knowledge
     except ValueError as error:
-        return str(error), []
+        return str(error), [], allow_outside_knowledge
     except Exception as error:
-        return f"Something went wrong while generating an answer: {error}", []
+        return (
+            f"Something went wrong while generating an answer: {error}",
+            [],
+            allow_outside_knowledge,
+        )
 
 
-def render_assistant_message(content: str, sources: list[str] | None = None) -> None:
+def render_mode_badge(allow_outside_knowledge: bool) -> None:
+    badge = "🧠 Assisted Mode" if allow_outside_knowledge else "🔒 Closed-Book Mode"
+    st.markdown(f"**{badge}**")
+
+
+def render_assistant_message(
+    content: str,
+    sources: list[str] | None = None,
+    allow_outside_knowledge: bool = False,
+) -> None:
+    render_mode_badge(allow_outside_knowledge)
     st.markdown(content)
     if sources:
         with st.expander(f"Source chunks ({len(sources)})"):
@@ -190,6 +208,13 @@ indexed_filenames = [entry["filename"] for entry in registry_entries]
 
 with st.sidebar:
     st.header("Document")
+
+    st.toggle(
+        "Allow Limited Outside Knowledge",
+        value=False,
+        key="allow_outside_knowledge",
+        help="When enabled, the assistant may supplement missing details from model knowledge.",
+    )
 
     if indexed_filenames:
         default_index = 0
@@ -246,7 +271,11 @@ with st.sidebar:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         if message["role"] == "assistant":
-            render_assistant_message(message["content"], message.get("sources"))
+            render_assistant_message(
+                message["content"],
+                message.get("sources"),
+                message.get("allow_outside_knowledge", False),
+            )
         else:
             st.markdown(message["content"])
 
@@ -257,9 +286,14 @@ if prompt := st.chat_input("Ask a question about your PDF..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Searching document and generating answer..."):
-            answer, sources = generate_response(prompt)
-        render_assistant_message(answer, sources)
+            answer, sources, allow_outside_knowledge = generate_response(prompt)
+        render_assistant_message(answer, sources, allow_outside_knowledge)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "allow_outside_knowledge": allow_outside_knowledge,
+        }
     )
